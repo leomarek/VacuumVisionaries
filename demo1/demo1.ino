@@ -1,122 +1,275 @@
+
+//relevant import statements
 #include <MusicDefinitions.h>
 #include <XT_DAC_Audio.h>
 #include "lowbat.h"
 #include "pumperror.h"
 #include "tankfull.h"
-
-
-//测试通过
-
 #include <vector>
 #include <SPI.h>
 #include <SD.h>
 #include <FS.h>
-
 #include "ESP32_SPI_9341.h"
 #include <driver/dac.h>
 
+// Define Pins
 #define SD_SCK 18
 #define SD_MISO 19
 #define SD_MOSI 23
 #define SD_CS 5
-
 #define LIGHT_ADC 34
-
- 
-// wired connections
-#define HG7881_B_IA 22 // D10 --> Motor B Input A --> MOTOR B +
-#define HG7881_B_IB 27 // D11 --> Motor B Input B --> MOTOR B -
-//#define FL_PIN 22
-// functional connections
+#define HG7881_B_IA 22 // IO22 --> Motor B Input A --> MOTOR B +
+#define HG7881_B_IB 27 // IO27 --> Motor B Input B --> MOTOR B -
+#define FL_PIN 35 // float switch pin
 #define MOTOR_B_PWM HG7881_B_IA // Motor B PWM Speed
 #define MOTOR_B_DIR HG7881_B_IB // Motor B Direction
- 
-// the actual values for "fast" and "slow" depend on the motor
-//#define PWM_SLOW 150  // arbitrary slow speed PWM duty cycle
-//#define PWM_FAST 255 // arbitrary fast speed PWM duty cycle
-#define DIR_DELAY 1000 // brief delay for abrupt motor changes
 
-XT_Wav_Class pumperror(pumperrorwav);     // create an object of type XT_Wav_Class that is used by the dac audio class (below), passing wav data as parameter.
+// create an object of type XT_Wav_Class for each error to be used by the dac audio class (below), passing wav data as parameter.
+XT_Wav_Class pumperror(pumperrorwav);     
 XT_Wav_Class lowbat(lowbatwav);
 XT_Wav_Class tankfull(tankfullwav);
                                       
-XT_DAC_Audio_Class DacAudio(26,0);    // Create the main player class object. 
-                                      // Use GPIO 25, one of the 2 DAC pins and timer 0
-XT_Sequence_Class Sequence;               // The sequence object, you add your sounds above to this object (see setup below)
+XT_DAC_Audio_Class DacAudio(26,0); // Create the main player class object using GPIO 26, one of the DAC pins and timer 0
+XT_Sequence_Class Sequence; // The sequence object to add sounds to
 
+// Pins for integrated led on back of sunton board
 int led_pin[3] = {17, 4, 16};
-#define FL_PIN 35
 
+// Initialize SPI for SD card
 SPIClass SD_SPI;
 
+// Initialize lcd using LGFX from the ESP32_... .h
 LGFX lcd;
 
-//PImage up;
+// Global variables for method usage
+boolean pumpState = false;
+
+// Represents wether any error is active or no error is active
+boolean activeError = false;
+
+// Represents status of battery, float switch, and pump errors respectively
+String activeErrors[3] = {"", "", ""};
+
+// Ticker used to iterate through active errors
+double curErr = 0;
+
+// Float switch state (digital)
+int floatState;
+// Previous float switch state
+int prevState = HIGH;
+
+// Default pressure setpoint (mmHg)
+int setpoint = 100;
+
+// Default error message
+String errorMessage = "";
+
+// Array represents location of latest touch point
+int pos[2] = {0, 0};
+
+// Timer to apropriately trigger error messages
+long timer = millis();
 
 void setup(void)
 {
+    // Set led pins to output mode
     pinMode(led_pin[0], OUTPUT);
     pinMode(led_pin[1], OUTPUT);
     pinMode(led_pin[2], OUTPUT);
 
+    // Begin serial
     Serial.begin(115200);
+
+    // Set motor controller pins to output mode
     pinMode( MOTOR_B_DIR, OUTPUT );
     pinMode( MOTOR_B_PWM, OUTPUT );
+
+    // Set motor pwm to low
     digitalWrite( MOTOR_B_DIR, LOW );
     digitalWrite( MOTOR_B_PWM, LOW );
-    pinMode(FL_PIN, INPUT_PULLUP);
-    // pinMode(LCD_BL, OUTPUT);
-    // digitalWrite(LCD_BL, HIGH);
 
+    // Set float switch pin to input with internal pullup resistor
+    pinMode(FL_PIN, INPUT_PULLUP);
+
+    // Run lcd init method
     lcd.init();
+
+    // Initialize and test SD card
     sd_init();
     sd_test();
 
-    //up = lcd.loadImage("up.bmp");
-    //down = lcd.loadImage("down.bmp");
-
+    // set lcd to horizintal orientation
     lcd.setRotation(1);
-    print_img(SD, "/up.bmp", 240, 320);
 
     delay(1000);
     init_gui();
 }
 
-static int colors[] = {TFT_RED, TFT_GREEN, TFT_BLUE, TFT_YELLOW};
-
-int i = 0;
-long runtime_0 = 0;
-long runtime_1 = 0;
-
 void loop(void)
 {
-    init_gui();
-    if ((millis() - runtime_0) > 1000)
-    {
-        led_set(i);
-        lcd.fillScreen(colors[i++]);
-
-        if (i > 3)
+    DacAudio.FillBuffer(); // Fill the sound buffer with data
+    floatState = digitalRead(FL_PIN); // Read the float switch state
+    Serial.println(floatState);
+    if(floatState == LOW){
+      activeErrors[1] = "Tank Full";
+      activeError = true;
+    }
+    else if (floatState!=prevState){
+      activeErrors[1] = "";
+      activeError = false;
+      update_gui(setpoint, "");
+    }
+    prevState = floatState;
+    if (lcd.getTouch(&pos[0], &pos[1]))
         {
-            i = 0;
+            if (pos[0] < 1100 && pos[1] < -2000){
+                Serial.println("up");
+                setpoint=setpoint+5;
+            }
+            if (pos[0] < 1100 && pos[1] > -1500){
+                Serial.println("down");
+                setpoint=setpoint-5;
+            }
+            if (pos[0] > 1750 && pos[1] < -3000){
+                pumpState = !pumpState;
+                delay(25);
+            }
+            setpoint = constrain(setpoint, 0, 150);
+            if(pumpState){
+              digitalWrite( MOTOR_B_DIR, LOW );
+              int pwm = map(setpoint,0,150,0,255);
+              digitalWrite( MOTOR_B_PWM, pwm);
+            }
+            else{
+              digitalWrite( MOTOR_B_PWM, LOW);
+            }
+            if((int)curErr == curErr and activeError){
+              errorMessage = activeErrors[(int)curErr];
+            }
+            else{
+              errorMessage = "";
+            }
+            update_gui(setpoint,errorMessage);
+            Serial.print(pos[0]);
+            Serial.print(" - ");
+            Serial.println(pos[1]);
+            delay(100);
         }
 
-        runtime_0 = millis();
+
+  if(millis()-timer>=1200){
+    Sequence.RemoveAllPlayItems(); // Clear out any previous playlist
+    
+    // Increment the error variable, ensure it never exceeds three
+    curErr+=0.5; 
+    if (curErr>=3){
+    curErr-=3;
     }
 
-    if ((millis() - runtime_1) > 300)
-    {
-        int adc_value = analogRead(LIGHT_ADC);
-        Serial.printf("ADC:%d\n", adc_value);
-        if (adc_value > 50)
-            lcd.setBrightness(50);
-        else
-            lcd.setBrightness(255);
-        runtime_1 = millis();
+    // If there is an active error
+    if(activeError){
+      
+      // This is true for every other counter
+      if((int)curErr == curErr){
+        
+      // For any non empty error message
+      errorMessage = activeErrors[(int)curErr];
+      if(errorMessage.length()!=0){
+          
+        // Add corresponding audio alert to sequence
+        switch((int)curErr){
+          case 0: Sequence.AddPlayItem(&lowbat);break;
+          case 2: Sequence.AddPlayItem(&pumperror);break;
+          case 1: Sequence.AddPlayItem(&tankfull);break;
+        }
+  
+        // Update the GUI with relevant error message
+        update_gui(setpoint, errorMessage);
+        }
+      }
     }
-    delay(10);
+
+    // Play sequence and update timer
+    DacAudio.Play(&Sequence);
+    timer = millis();
+  }
 }
 
+void init_gui(){
+  // Set font and update GUI
+  lcd.setFont(&fonts::FreeSansBold9pt7b);
+  update_gui(setpoint, "");
+}
+
+void update_gui(int setpoint, String error){
+
+    // Start with blank white screen
+    lcd.fillScreen(TFT_WHITE);
+
+    // Use black text
+    lcd.setTextColor(TFT_BLACK);
+
+    // If the pump is on, draw pump enabled bar
+    if(pumpState){
+      lcd.fillRoundRect( 10, 10, 180, 45, 4, TFT_GREEN);
+      lcd.setCursor(20, 20);
+      lcd.setTextSize(1.3);
+      lcd.print("Pump Enabled");
+
+      // Set internal LED to green
+      digitalWrite(led_pin[0], HIGH);
+      digitalWrite(led_pin[1], HIGH);
+      digitalWrite(led_pin[2], LOW);
+    }
+
+    // If the pump is not on, draw pump disabled bar
+    else{
+      lcd.fillRoundRect( 10, 10, 180, 45, 4, TFT_RED);
+      lcd.setCursor(20, 20);
+      lcd.setTextSize(1.3);
+      lcd.setTextColor(TFT_WHITE);
+      lcd.print("Pump Disabled");
+      lcd.setTextColor(TFT_BLACK);
+
+      // Set internal led to red
+      digitalWrite(led_pin[0], HIGH);
+      digitalWrite(led_pin[1], LOW);
+      digitalWrite(led_pin[2], HIGH);
+    }
+
+    // Print setpoint in large text
+    lcd.setTextSize(5);
+    lcd.setCursor(10, 75);
+    lcd.print(String(setpoint));
+
+    // Account for spacing on two digit numbers
+    if(setpoint<100){
+      lcd.print("  ");
+    }
+
+    // Draw mmHg label to right of reading
+    lcd.setTextSize(2);
+    lcd.println(" mm");
+    lcd.setTextSize(5);
+    lcd.print("       ");
+    lcd.setTextSize(2);
+    lcd.println("Hg");
+
+    // Draw triangles for adjustment buttons
+    lcd.fillTriangle  ( 245, 70, 275, 25, 305, 70, TFT_BLACK);
+    lcd.fillTriangle  ( 245, 160, 275, 205, 305, 160, TFT_BLACK);
+
+    // Print error message as given by the caller method
+    lcd.setTextColor(TFT_RED);
+    lcd.setCursor(20, 165);
+    lcd.setTextSize(2);
+    lcd.print(error);
+
+    // Wait to prevent flashing
+    delay(5);
+}
+
+// initialize SD card connection over SPI
 void sd_init()
 {
     SD_SPI.begin(SD_SCK, SD_MISO, SD_MOSI);
@@ -136,6 +289,7 @@ void sd_init()
     Serial.println("SD init over.");
 }
 
+//test sd card SPI connection
 void sd_test()
 {
     uint8_t cardType = SD.cardType();
@@ -170,6 +324,7 @@ void sd_test()
     listDir(SD, "/", 0);
 }
 
+// directory scanning sample method
 void listDir(fs::FS &fs, const char *dirname, uint8_t levels)
 {
     Serial.printf("Listing directory: %s\n", dirname);
@@ -237,151 +392,7 @@ int print_img(fs::FS &fs, String filename, int x, int y)
     return 0;
 }
 
-boolean pumpState = false;
-//represents status of battery, float switch, and pump errors respectively
-boolean activeError = false;
-String activeErrors[3] = {"", "", ""};
-double curErr = 0;
-int floatState;
-int prevState = HIGH;
-
-void init_gui(){
-  int setpoint = 100;
-  lcd.setFont(&fonts::FreeSansBold9pt7b);
-  String errorMessage = "";
-  update_gui(setpoint, "");
-  int pos[2] = {0, 0};
-  long timer = millis();
-  while(true){
-    DacAudio.FillBuffer();                // Fill the sound buffer with data
-    floatState = digitalRead(FL_PIN);
-    Serial.println(floatState);
-    if(floatState == LOW){
-      activeErrors[1] = "Tank Full";
-      activeError = true;
-    }
-    else if (floatState!=prevState){
-      activeErrors[1] = "";
-      activeError = false;
-      update_gui(setpoint, "");
-    }
-    prevState = floatState;
-    if (lcd.getTouch(&pos[0], &pos[1]))
-        {
-            if (pos[0] < 1100 && pos[1] < -2000){
-                Serial.println("up");
-                setpoint=setpoint+5;
-            }
-            if (pos[0] < 1100 && pos[1] > -1500){
-                Serial.println("down");
-                setpoint=setpoint-5;
-            }
-            if (pos[0] > 1750 && pos[1] < -3000){
-                pumpState = !pumpState;
-                delay(25);
-            }
-            setpoint = constrain(setpoint, 0, 150);
-            if(pumpState){
-              digitalWrite( MOTOR_B_DIR, LOW );
-              int pwm = map(setpoint,0,150,0,255);
-              digitalWrite( MOTOR_B_PWM, pwm);
-            }
-            else{
-              digitalWrite( MOTOR_B_PWM, LOW);
-            }
-            if((int)curErr == curErr and activeError){
-              errorMessage = activeErrors[(int)curErr];
-            }
-            else{
-              errorMessage = "";
-            }
-            update_gui(setpoint,errorMessage);
-            Serial.print(pos[0]);
-            Serial.print(" - ");
-            Serial.println(pos[1]);
-            delay(100);
-        }
-
-
-  if(millis()-timer>=1200){
-    Sequence.RemoveAllPlayItems();            // Clear out any previous playlist
-    curErr+=0.5;
-    if (curErr>=3){
-    curErr-=3;
-    }
-    //Serial.println(curErr);
-        
-    if(activeError){
-      if((int)curErr == curErr){
-      errorMessage = activeErrors[(int)curErr];
-      if(errorMessage.length()!=0){
-      switch((int)curErr)
-      {
-        case 0: Sequence.AddPlayItem(&lowbat);break;
-        case 2: Sequence.AddPlayItem(&pumperror);break;
-        case 1: Sequence.AddPlayItem(&tankfull);break;
-
-      }
-      update_gui(setpoint, errorMessage);
-      }
-      
-      }
-    }
-    DacAudio.Play(&Sequence);
-    timer = millis();
-  }
-  }
-
-}
-void update_gui(int setpoint, String error){
-    lcd.fillScreen(TFT_WHITE);
-
-    lcd.setTextColor(TFT_BLACK);
-    if(pumpState){
-      lcd.fillRoundRect( 10, 10, 180, 45, 4, TFT_GREEN);
-      lcd.setCursor(20, 20);
-      lcd.setTextSize(1.3);
-      lcd.print("Pump Enabled");
-      digitalWrite(led_pin[0], HIGH);
-      digitalWrite(led_pin[1], HIGH);
-      digitalWrite(led_pin[2], LOW);
-    }
-    else{
-      lcd.fillRoundRect( 10, 10, 180, 45, 4, TFT_RED);
-      lcd.setCursor(20, 20);
-      lcd.setTextSize(1.3);
-      lcd.setTextColor(TFT_WHITE);
-      lcd.print("Pump Disabled");
-      lcd.setTextColor(TFT_BLACK);
-      digitalWrite(led_pin[0], HIGH);
-      digitalWrite(led_pin[1], LOW);
-      digitalWrite(led_pin[2], HIGH);
-    }
-    lcd.setTextSize(5);
-    lcd.setCursor(10, 75);
-    lcd.print(String(setpoint));
-    if(setpoint<100){
-      lcd.print("  ");
-    }
-    lcd.setTextSize(2);
-    lcd.println(" mm");
-    lcd.setTextSize(5);
-    lcd.print("       ");
-    lcd.setTextSize(2);
-    lcd.println("Hg");
-
-    //print_img(SD, "up.bmp", 60, 60);
-    lcd.fillTriangle  ( 245, 70, 275, 25, 305, 70, TFT_BLACK);
-    lcd.fillTriangle  ( 245, 160, 275, 205, 305, 160, TFT_BLACK);
-
-        lcd.setTextColor(TFT_RED);
-        lcd.setCursor(20, 165);
-        lcd.setTextSize(2);
-        lcd.print(error);
-
-    delay(5);
-}
-
+// example used for touchscreen calibration
 void touch_calibration()
 {
     lcd.fillScreen(TFT_YELLOW);
@@ -401,7 +412,8 @@ void touch_calibration()
     lcd.calibrateTouch(nullptr, fg, bg, std::max(lcd.width(), lcd.height()) >> 3);
 }
 
-void touch_continue()
+// helper method for touch calibration
+void touch_continue() 
 {
     lcd.fillScreen(TFT_YELLOW);
 
@@ -425,32 +437,4 @@ void touch_continue()
         }
     }
 }
-
-void led_set(int i)
-{
-    if (i == 0)
-    {
-        digitalWrite(led_pin[0], LOW);
-        digitalWrite(led_pin[1], HIGH);
-        digitalWrite(led_pin[2], HIGH);
-    }
-    if (i == 1)
-    {
-        digitalWrite(led_pin[0], HIGH);
-        digitalWrite(led_pin[1], LOW);
-        digitalWrite(led_pin[2], HIGH);
-    }
-    if (i == 2)
-    {
-        digitalWrite(led_pin[0], HIGH);
-        digitalWrite(led_pin[1], HIGH);
-        digitalWrite(led_pin[2], LOW);
-    }
-
-    if (i == 3)
-    {
-        digitalWrite(led_pin[0], LOW);
-        digitalWrite(led_pin[1], LOW);
-        digitalWrite(led_pin[2], LOW);
-    }
 }
